@@ -1,0 +1,37 @@
+[tool.poetry]
+name = "main-program-test"
+version = "0.1.0"
+description = ""
+authors = ["zzanggu-SW <gyeongmin951@aiofarm.co.kr>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+pydantic = "^2.8.2"
+requests = "^2.32.3"
+pyserial = "^3.5"
+toml = "^0.10.2"
+numpy = "^2.0.1"
+opencv-python = "^4.10.0.84"
+pillow = "^10.4.0"
+bs4 = "^0.0.2"
+server-config-model = {git = "https://github.com/aioFarm/server-config-model.git", rev = "v0.1-alpha"}
+psutil = "^6.0.0"
+
+[tool.poetry.group.dev.dependencies]
+black = "^24.8.0"
+isort = "^5.13.2"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.isort]
+profile = "black"
+line_length = 88
+multi_line_output = 3
+
+[tool.black]
+line_length = 88
+target_version = ['py311']
+skip_string_normalization = false
