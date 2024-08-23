@@ -30,6 +30,7 @@ from server_config_model import (
     ServerConfig,
     load_server_root_config,
     save_config,
+    backup_config,
 )
 from server_config_model import EncodingEnum, FormatEnum
 
@@ -356,8 +357,8 @@ class SerialTestTab(QWidget):
             QMessageBox.critical(self, "Write Error", f"Failed to write to serial: {e}")
         else:
             config.serial_config.baudrate = baudrate
-            config.serial_config.message_encode_type = EncodingEnum(selected_encoder)
-            config.serial_config.message_format_type = FormatEnum(selected_format)
+            config.serial_config.test_message_encode_type = EncodingEnum(selected_encoder)
+            config.serial_config.test_message_format_type = FormatEnum(selected_format)
             config.serial_config.test_message_to_sorter = message
             save_config(root_config=root_config)
         finally:
@@ -770,8 +771,6 @@ def merge_toml_files(existing_toml_path, new_toml_path):
     return merged_toml
 
 
-import os
-
 from PyQt5.QtWidgets import QFileDialog
 
 
@@ -821,10 +820,10 @@ class SignalSettings(QTabWidget):
         )
         
         self.serial_test_tab.encoder_combo.setCurrentText(
-            config.serial_config.message_encode_type.value
+            config.serial_config.test_message_encode_type.value
         )
         self.serial_test_tab.format_combo.setCurrentText(
-            config.serial_config.message_format_type.value
+            config.serial_config.test_message_format_type.value
         )
 
         self.setTabEnabled(2, True)
@@ -884,6 +883,7 @@ class SignalSettings(QTabWidget):
 
 
 if __name__ == "__main__":
+    backup_config()
     app = QApplication(sys.argv)
     ex = SignalSettings()
     ex.show()
