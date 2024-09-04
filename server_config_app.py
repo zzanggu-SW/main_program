@@ -1,4 +1,6 @@
+import asyncio
 import importlib
+import json
 import logging
 import os
 import re
@@ -6,10 +8,16 @@ import shutil
 import subprocess
 import sys
 import threading
+from enum import Enum
+import queue
+from datetime import datetime
+from pathlib import Path
 
+from result_sender_thread import ResultSenderThread
+from server import connected_line_set, broadcast_message
 import serial.tools.list_ports
 import toml
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QIcon, QIntValidator, QKeyEvent, QKeySequence
 from PyQt5.QtWidgets import (
     QAction,
@@ -27,22 +35,46 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
     qApp,
+    QSpinBox,
+    QScrollArea,
+    QFrame,
+    QProgressDialog,
+    QApplication, QWidget, QVBoxLayout, QLabel, QLineEdit, QPushButton, QFormLayout, QGroupBox, QHBoxLayout,
+    QTableWidget, QTableWidgetItem, QTableWidgetItem
+
 )
 from server_config_model import (
     EncodingEnum,
     FormatEnum,
     RootConfig,
     ServerConfig,
+    Line,
     backup_config,
     load_server_root_config,
     save_config,
 )
+import uvicorn
 
+from server import FastAPIServerThread
+
+
+
+class NeedPackageEnum(str, Enum):
+    ResultSender = "result_sender"
+    LocalServer = "local_server"
+
+class TabIndexEnum(Enum):
+    LINE_COUNT = 0
+    SERIAL_TEST = 1
+    SPECIFICATION_UPLOAD = 2
+    ARDUINO_UPLOAD = 3
+    CONVEYOR_MESSAGE = 4
 
 class LineCountTab(QWidget):
-    def __init__(self, parent=None, tab_widget=None):
+    def __init__(self, parent=None, tab_widget=None, main_widget=None):
         super(LineCountTab, self).__init__(parent)
         self.tab_widget = tab_widget
+        self.main_widget = main_widget
         self.initUI()
 
     def initUI(self):
@@ -55,31 +87,107 @@ class LineCountTab(QWidget):
         line_layout.addWidget(self.line_edit)
         self.line_edit.setValidator(QIntValidator())  # Allow only integers
 
-        self.next_button = QPushButton("Next")
+        # TODO 현재 프로그램의 ipconfig 결과를 보여주는 것 필요
+
+        # ipconfig 결과를 보여주는 섹션
+        ipconfig_layout = QVBoxLayout()
+        ipconfig_label = QLabel("2. 현재 프로그램의 ipconfig 결과:")
+        
+        self.ipconfig_text = QTextEdit()
+        self.ipconfig_text.setReadOnly(True)
+        
+        # ipconfig 명령 실행 결과 가져오기
+        ipconfig_result = self.get_ipconfig_result()
+        self.ipconfig_text.setPlainText(ipconfig_result)
+
+        ipconfig_layout.addWidget(ipconfig_label)
+        ipconfig_layout.addWidget(self.ipconfig_text)
+
+        self.next_button = QPushButton("Save and Next")
         self.next_button.clicked.connect(self.on_next)
         button_layout = QHBoxLayout()
         button_layout.addStretch(1)
         button_layout.addWidget(self.next_button)
 
         layout.addLayout(line_layout)
+        layout.addLayout(ipconfig_layout)
         layout.addLayout(button_layout)
         self.setLayout(layout)
         self.line_edit.setFocus()
 
+    def get_ipconfig_result(self):
+        try:
+            # Windows에서 ipconfig 명령 실행 (Linux/Mac에서는 ifconfig 사용)
+            result = subprocess.run(["ipconfig"], capture_output=True, text=True)
+            return result.stdout
+        except Exception as e:
+            return f"Error: {e}"
+
     def on_next(self):
         line_count = self.line_edit.text()
-        if line_count:
-            self.save_line_count(int(line_count))
+        if not line_count or not int(line_count):
+            QMessageBox.warning(
+                self,
+                "No line count",
+                "라인 개수를 입력해주세요",
+            )
+            return
+        
+        # self.save_line_count(int(line_count))
+        before_root_config: RootConfig = load_server_root_config()
+        before_config: ServerConfig = before_root_config.config
+        before_line_count = before_config.program_config.line_count
+        is_read_configured = before_config.serial_config.is_read_configured
+        is_send_configured = before_config.serial_config.is_send_configured
+        production_module = before_config.serial_config.production_result_sender_module
+        print([is_read_configured, is_send_configured, int(before_line_count) != int(line_count)])
+        if not any([is_read_configured, is_send_configured, int(before_line_count) != int(line_count)]):  # 기존 설정이 아무 것도 없음
+            self.save_line_count(int(line_count))            
             current_index = self.tab_widget.currentIndex()
             self.tab_widget.setTabEnabled(current_index + 1, True)
             self.tab_widget.setCurrentIndex(current_index + 1)
-
+            return        
+        # 라인 변경 시에 설정 값의 삭제를 확인합니다.
+        reply = QMessageBox.question(
+            self, 
+            '저장 확인',
+            "라인 개수 변경 시에, 프로덕션 아두이노 설정을 다시 해야합니다. 진행하시겠습니까?"
+            "변경 이후 프로그램 재실행됩니다.",
+            QMessageBox.Yes | QMessageBox.No, 
+            QMessageBox.No
+        )
+        if reply == QMessageBox.No:
+            return
+        
+        before_config.program_config.line_count = int(line_count)
+        is_saved = self.main_widget.save_root_config(before_root_config)
+        if not is_saved:
+            return
+        if not production_module:
+            current_index = self.tab_widget.currentIndex()
+            self.tab_widget.setTabEnabled(current_index + 1, True)
+            self.tab_widget.setCurrentIndex(current_index + 1)
+            return
+    
+        try:
+            result_sender_module = self.main_widget.get_result_sender_module(production_module)
+            result_sender = getattr(result_sender_module, 'ResultSender', None)
+            if result_sender:
+                result_sender.create_default_config()
+            else:
+                QMessageBox.critical(self, "오류", "모듈을 불러오는 데 실패했습니다. 재실행 이후에도 같은 문제 발생 시 관리자 문의")
+                return
+            QMessageBox.information(self, "완료", "설정이 성공적으로 변경되었습니다. 프로그램 재실행합니다.")
+            self.main_widget.restart_program()
+        except ImportError as e:
+            QMessageBox.critical(self, "오류 관리자 문의 필요", f"모듈 저장 실패: {e}")
+            
     def save_line_count(self, line_count):
         root_config: RootConfig = load_server_root_config()
         config: ServerConfig = root_config.config
         if config is not None:
             config.program_config.line_count = line_count
-            save_config(root_config)
+            self.main_widget.save_root_config(root_config)
 
 
 class UploadDialog(QDialog):
@@ -145,9 +253,10 @@ class CustomLineEdit(QLineEdit):
 
 
 class SerialTestTab(QWidget):
-    def __init__(self, parent=None, tab_widget=None):
+    def __init__(self, parent=None, tab_widget=None, main_widget=None):
         super(SerialTestTab, self).__init__(parent)
         self.tab_widget = tab_widget
+        self.main_widget = main_widget
         self.serial_connection = None
         self.write_serial_connection = None
         self.initUI()
@@ -156,6 +265,10 @@ class SerialTestTab(QWidget):
     def initUI(self):
         layout = QVBoxLayout()
 
+        if self.layout() is not None:
+            # 기존 레이아웃을 새로운 빈 QWidget에 설정하여 제거
+            QWidget().setLayout(self.layout())
+            
         self.label = QLabel(
             "<h1>시리얼 테스트</h1>"
             "<h3><b>내부 시리얼</b> 선의 정상 여부를 확인하는 작업</h3>"
@@ -305,7 +418,7 @@ class SerialTestTab(QWidget):
             self.serial_connection = serial.Serial(port, baudrate, timeout=1)
             self.disconnect_button.setEnabled(True)
             self.connect_button.setEnabled(False)
-            self.text_edit.append(f"Connected to {port} at {baudrate} baud.")
+            self.main_widget.update_log(f"Connected to {port} at {baudrate} baud.")
             self.start_reading_thread()
         except serial.SerialException as e:
             QMessageBox.critical(self, "Connection Error", f"Failed to connect: {e}")
@@ -318,7 +431,7 @@ class SerialTestTab(QWidget):
             print(self.write_serial_connection, port, baudrate)
             self.disconnect_button.setEnabled(True)
             self.connect_button.setEnabled(False)
-            self.text_edit.append(f"Connected to {port} at {baudrate} baud.")
+            self.main_widget.update_log(f"Connected to {port} at {baudrate} baud.")
             self.start_reading_thread()
         except serial.SerialException as e:
             QMessageBox.critical(self, "Connection Error", f"Failed to connect: {e}")
@@ -333,7 +446,7 @@ class SerialTestTab(QWidget):
             self.serial_connection.close()
             self.disconnect_button.setEnabled(False)
             self.connect_button.setEnabled(True)
-            self.text_edit.append("Disconnected.")
+            self.main_widget.update_log("Disconnected.")
 
     def write_serial_message(self):
         root_config: RootConfig = load_server_root_config()
@@ -365,7 +478,9 @@ class SerialTestTab(QWidget):
             )
             config.serial_config.test_message_format_type = FormatEnum(selected_format)
             config.serial_config.test_message_to_sorter = message
-            save_config(root_config=root_config)
+            is_saved = self.main_widget.save_root_config(root_config=root_config)
+            if not is_saved:
+                return
         finally:
             if self.write_serial_connection.is_open:
                 self.write_serial_connection.close()
@@ -480,6 +595,13 @@ class SerialTestTab(QWidget):
         self.tab_widget.setCurrentIndex(current_index - 1)
 
     def on_next(self):
+        
+        root_config: RootConfig = load_server_root_config()
+        config: ServerConfig = root_config.config
+        
+        if not config.arduino_config.is_upload_port_assigned:
+            QMessageBox.warning(self, "업로드 포트 확인", "읽기 테스트 아두이노 업로드를 진행해주세요.")
+            return
         current_index = self.tab_widget.currentIndex()
         self.tab_widget.setTabEnabled(current_index + 1, True)
         self.tab_widget.setCurrentIndex(current_index + 1)
@@ -491,7 +613,7 @@ class SerialTestTab(QWidget):
             while self.serial_connection and self.serial_connection.is_open:
                 if self.serial_connection and self.serial_connection.in_waiting > 0:
                     line = self.serial_connection.readline().decode("utf-8").strip()
-                    self.text_edit.append(line)
+                    self.main_widget.update_log(line)
 
         thread = threading.Thread(target=read_from_port, daemon=True)
         thread.start()
@@ -612,10 +734,13 @@ class UploadDialog(QDialog):
                 self.parent().baudrate_combo.currentText()
             )
             config.arduino_config.test_message = self.parent().message_edit.text()
-
-            save_config(root_config)
-            self.parent().tab_widget.load_previous_settings()
-            self.uploaded_port.emit(True, f"{port} 업로드 성공 및 저장 완료!")
+            config.arduino_config.is_upload_port_assigned = True
+            config.serial_config.is_production_sketch_uploaded = False
+            config.serial_config.is_read_configured = False
+            config.serial_config.is_send_configured = False
+            is_saved = self.parent().main_widget.save_root_config(root_config)
+            self.uploaded_port.emit(True, f"{port} 업로드 성공 및 저장 완료! 프로그램 재시작")
+            
         else:
             self.uploaded_port.emit(False, f"{port} 업로드 실패: {stderr}")
 
@@ -625,6 +750,7 @@ class UploadDialog(QDialog):
     def uploaded_info(self, is_succeed, port):
         if is_succeed:
             QMessageBox.information(self, "업로드 성공", port)
+            self.parent().main_widget.restart_program()
         else:
             QMessageBox.information(self, "업로드 실패", port)
 
@@ -632,19 +758,163 @@ class UploadDialog(QDialog):
         self.reject()  # Ensure the dialog is properly closed
 
 
+# TODO 현재 config model 틀과 시리얼 틀 맞는 것만 display??  idea
+
+# TODO 현재 모듈이 있으면 저장되어 있는 것 드롭다운 display, 선택할 수 있게
+
 class ArduinoUploadTab(QWidget):
-    def __init__(self, parent=None, tab_widget=None):
+    def __init__(self, parent=None, tab_widget=None, main_widget=None):
         super(ArduinoUploadTab, self).__init__(parent)
+        self.serial_result = None
         self.tab_widget = tab_widget
+        self.main_widget = main_widget
         self.initUI()
 
     def initUI(self):
-        layout = QVBoxLayout()
+        self.root_config: RootConfig = load_server_root_config()
+        self.config: ServerConfig = self.root_config.config
+        # 기존 레이아웃 제거 (있을 경우)
+        if self.layout() is not None:
+            # 기존 레이아웃을 새로운 빈 QWidget에 설정하여 제거
+            QWidget().setLayout(self.layout())
 
-        self.label = QLabel("3. 프로덕션 아두이노 코드 업로드")
-        # TODO local_server에서 app_start이외에 upload_arduino
-        layout.addWidget(self.label)
+        # 새로운 레이아웃 설정
+        layout = QVBoxLayout(self)
+        form_layout = QFormLayout()
 
+        # Create scrollable area for input fields
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        
+        scroll_widget = QWidget()
+        scroll_layout = QVBoxLayout(scroll_widget)
+        
+        input_group = QGroupBox("Inputs")
+        input_group.setStyleSheet("QGroupBox { background-color: lightgreen; }")  # 배경색 설정
+        input_layout = QFormLayout()
+        
+        self.input_fields = []
+
+        available_ports = [port.device for port in serial.tools.list_ports.comports()]
+        available_baudrates = [9600, 19200, 38400, 57600, 115200]
+        available_input_pins = range(2, 10)
+        
+        signal_count_label = QLabel("신호당 총 신호 수:")
+        self.signal_count_per_pulse = QSpinBox()
+        self.signal_count_per_pulse.setRange(1, 5)
+        self.signal_count_per_pulse.setValue(self.config.serial_config.signal_count_per_pulse)  # config에서 가져온 기본값 설정
+
+        form_layout.addRow(signal_count_label, self.signal_count_per_pulse)
+        layout.addLayout(form_layout)
+        
+        for idx, input_item in enumerate(self.config.serial_config.inputs):
+            # Add index label
+            input_layout.addRow(QLabel(f"Input {idx}"))
+            input_port = QComboBox()
+            input_port.addItems(available_ports)
+            input_port.setCurrentText(input_item.port)
+
+            input_baudrate = QComboBox()
+            input_baudrate.addItems(map(str, available_baudrates))
+            input_baudrate.setCurrentText(str(input_item.baudrate))
+
+            input_pin = QComboBox()
+            input_pin.addItems(map(str, available_input_pins))
+            input_pin.setCurrentText(str(input_item.pin))
+            
+            # Camera delay - 정수 입력란
+            camera_delay = QSpinBox()
+            camera_delay.setRange(0, 3000)
+            camera_delay.setValue(input_item.camera_delay)
+            
+            input_field_dict = {
+                "port": input_port,
+                "baudrate": input_baudrate,
+                "pin": input_pin,
+                "camera_delay": camera_delay
+            }
+            
+            self.input_fields.append(input_field_dict)
+
+            input_layout.addRow(QLabel("Port:"), input_port)
+            input_layout.addRow(QLabel("Baudrate:"), input_baudrate)
+            input_layout.addRow(QLabel("Pin:"), input_pin)
+            input_layout.addRow(QLabel("Camera Delay (ms):"), camera_delay)
+
+            # Add a separator line
+            line = QFrame()
+            line.setFrameShape(QFrame.HLine)
+            line.setFrameShadow(QFrame.Sunken)
+            input_layout.addRow(line)
+
+        input_group.setLayout(input_layout)
+        scroll_layout.addWidget(input_group)
+
+        # Create output section
+        output_group = QGroupBox("Outputs")
+        output_group.setStyleSheet("QGroupBox { background-color: #ffb0c1; }")  # 배경색 설정
+        output_layout = QFormLayout()
+        self.output_fields = []
+
+        available_output_pins = range(30, 38)
+
+        for idx, output_item in enumerate(self.config.serial_config.outputs):
+            # Add index label
+            output_layout.addRow(QLabel(f"Output {idx}"))
+
+            output_port = QComboBox()
+            output_port.addItems(available_ports)
+            output_port.setCurrentText(output_item.port)
+
+            output_baudrate = QComboBox()
+            output_baudrate.addItems(map(str, available_baudrates))
+            output_baudrate.setCurrentText(str(output_item.baudrate))
+
+            output_offset = QSpinBox()
+            output_offset.setRange(0, 1000)
+            output_offset.setValue(output_item.offset)
+
+            output_pin = QComboBox()
+            output_pin.addItems(map(str, available_output_pins))
+            output_pin.setCurrentText(str(output_item.pin))
+
+            output_field_dict = {
+                "port": output_port,
+                "baudrate": output_baudrate,
+                "pin": output_pin,
+                "offset": output_offset
+            }
+            
+            self.output_fields.append(output_field_dict)
+
+            output_layout.addRow(QLabel("Port:"), output_port)
+            output_layout.addRow(QLabel("Baudrate:"), output_baudrate)
+            output_layout.addRow(QLabel("Offset:"), output_offset)
+            output_layout.addRow(QLabel("Pin:"), output_pin)
+
+            # Add a separator line
+            line = QFrame()
+            line.setFrameShape(QFrame.HLine)
+            line.setFrameShadow(QFrame.Sunken)
+            output_layout.addRow(line)
+
+        output_group.setLayout(output_layout)
+        scroll_layout.addWidget(output_group)
+
+        scroll_area.setWidget(scroll_widget)
+        layout.addWidget(scroll_area)
+
+        self.setWindowTitle("Serial Configuration")
+        self.setGeometry(300, 300, 400, 300)
+        button_layout = QHBoxLayout()
+
+        validate_button = QPushButton("유효성 검사, 저장, 업로드")
+        validate_button.clicked.connect(self.validate_inputs)
+
+        button_layout.addWidget(validate_button)
+
+        layout.addLayout(button_layout)
+        
         self.prev_button = QPushButton("Previous")
         self.prev_button.clicked.connect(self.on_prev)
         self.next_button = QPushButton("Next")
@@ -656,73 +926,365 @@ class ArduinoUploadTab(QWidget):
 
         layout.addLayout(button_layout)
         self.setLayout(layout)
+    
+    def validate_inputs(self):
+        before_root_config: RootConfig = load_server_root_config()
+        self.save_config()
+        root_config: RootConfig = load_server_root_config()
+        config: ServerConfig = root_config.config
+        result_sender_module = config.serial_config.production_result_sender_module
+        if not config.serial_config.production_result_sender_module:
+            QMessageBox.critical(self, "모듈 에러", "현재 설정된 모듈이 없습니다. 관리자 문의.")
+            return
+        
+        result_sender_module = self.main_widget.get_result_sender_module(result_sender_module)
+        result_sender = getattr(result_sender_module, 'ResultSender', None)
+        try:
+            result_sender.check_valid_config()
+        except Exception as e:
+            QMessageBox.critical(self, "유효성 검사 실패, ", f"{e}")
+            self.main_widget.save_root_config(before_root_config)
+            self.initUI()
+            return
 
+        reply = QMessageBox.question(
+            self, 
+            '완료', 
+            "유효성 및 저장 완료했습니다. 업로드를 진행합니다.",
+            # "변경 이후 프로그램 재실행됩니다.",
+            QMessageBox.Yes | QMessageBox.No, 
+            QMessageBox.No
+        )
+        self.main_widget.update_log('업로드 시작.\n10초 내외의 시간이 걸립니다.')
+        if reply == QMessageBox.No:
+            return
+        try:
+            arduino_sketch = result_sender.get_arduino_sketch()
+        except Exception as e:
+            QMessageBox.critical(self, "유효성 검사 실패, ", f"{e}")
+            self.main_widget.save_root_config(before_root_config)
+            self.initUI()
+            return
+        
+        with open("main_program_test.ino", "w", encoding="utf-8") as f:
+            f.write(arduino_sketch)
+        
+        check_process = subprocess.Popen(
+            [
+                "arduino-cli",
+                "compile",
+                "--fqbn",
+                "arduino:avr:mega",
+                "main_program_test.ino",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8"  # 인코딩을 명시적으로 설정
+        )
+        chk_stdout, chk_stderr = check_process.communicate()
+        self.main_widget.update_log(chk_stdout)
+        if check_process.returncode != 0:
+            QMessageBox.critical(self, "실패", f"아두이노 코드 에러. 관리자에게 문의 필요합니다. {chk_stderr}")
+            return
+        upload_process = subprocess.Popen(
+            [
+                "arduino-cli",
+                "upload",
+                "-p",
+                config.arduino_config.port,
+                "--fqbn",
+                "arduino:avr:mega",
+                "main_program_test.ino",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8"  # 인코딩을 명시적으로 설정
+        )
+        stdout, stderr = upload_process.communicate()
+        self.main_widget.update_log(stdout)
+        if upload_process.returncode != 0:
+            QMessageBox.critical(self, "실패", f"업로드 실패, 업로드 포트  확인 필요합니다. {stderr}")
+            return
+        config.serial_config.is_production_sketch_uploaded = True
+        self.main_widget.save_root_config(root_config)
+        QMessageBox.information(self, "Success", "Uploaded arduino sketch!!")
+
+    def save_config(self):
+        root_config: RootConfig = load_server_root_config()
+        config: ServerConfig = root_config.config
+        serial_input_config_list = []
+        serial_output_config_list = []
+        for field_dict in self.input_fields:
+            input_serial_config = {
+                "port": field_dict["port"].currentText(),
+                "baudrate": int(field_dict["baudrate"].currentText()),
+                "pin": int(field_dict["pin"].currentText()),
+                "camera_delay": field_dict["camera_delay"].value()
+            }
+            serial_input_config_list.append(input_serial_config)
+
+        for field_dict in self.output_fields:
+            output_serial_config = {
+                "port": field_dict["port"].currentText(),
+                "baudrate": int(field_dict["baudrate"].currentText()),
+                "pin": int(field_dict["pin"].currentText()),
+                "offset": field_dict["offset"].value()
+            }
+            serial_output_config_list.append(output_serial_config)
+
+        config.serial_config.signal_count_per_pulse = self.signal_count_per_pulse.value()
+        config.serial_config.inputs = serial_input_config_list
+        config.serial_config.outputs = serial_output_config_list
+        is_saved = self.main_widget.save_root_config(root_config=root_config)
+        if not is_saved:
+            return
+    
     def on_prev(self):
         current_index = self.tab_widget.currentIndex()
         self.tab_widget.setCurrentIndex(current_index - 1)
 
     def on_next(self):
+        root_config: RootConfig = load_server_root_config()
+        config: ServerConfig = root_config.config
+        if not config.serial_config.is_production_sketch_uploaded:
+            QMessageBox.warning(self, "유효성 검사", "유효성 검사와 아두이노 업로드 이후에 가능합니다.")
+            return
         current_index = self.tab_widget.currentIndex()
         self.tab_widget.setTabEnabled(current_index + 1, True)
         self.tab_widget.setCurrentIndex(current_index + 1)
 
 
+class TableHeaders(Enum):
+    STATUS = "Status"
+    IP = "IP"
+    CLIENT_IDX = "Line Index"
+    TEST_GRADE = "Test 등급"
+
+
 class ConveyorMessageTab(QWidget):
-    def __init__(self, parent=None, tab_widget=None):
+    def __init__(self, parent=None, tab_widget=None, main_widget=None, loop=None, result_data_queue=None):
         super(ConveyorMessageTab, self).__init__(parent)
         self.tab_widget = tab_widget
+        self.main_widget = main_widget
+        self.loop = loop
+        self.result_data_queue = result_data_queue
+        self.result_sender_thread = None
         self.initUI()
 
     def initUI(self):
-        layout = QVBoxLayout()
+        root_config: RootConfig = load_server_root_config()
+        self.config: ServerConfig = root_config.config
+        
+        if self.layout() is not None:
+            # 기존 레이아웃을 새로운 빈 QWidget에 설정하여 제거
+            QWidget().setLayout(self.layout())
+        # 새로운 레이아웃 설정
+        layout = QVBoxLayout(self)
 
         self.label = QLabel("선별기 메시지 전송")
         layout.addWidget(self.label)
 
+        # Create the table
+        self.table = QTableWidget()
+        self.table.setRowCount(self.config.program_config.line_count)
+        self.table.setColumnCount(4)  # Status, IP, Line Index, Test 등급
+
+        self.table.setHorizontalHeaderLabels(["Status", "IP", "Line Index", "Test 등급"])
+        from server_config_app import connected_line_set
+        connected_ip_list = [line.client.host for line in connected_line_set]
+        lines = sorted(self.config.program_config.lines, key=lambda c: c.ip)
+        for idx, line in enumerate(lines):
+            # Status Column (green/gray)
+            status_item = QTableWidgetItem()
+            status_item.setFlags(Qt.ItemIsEnabled)  # Make it read-only
+            status_item.setBackground(Qt.green if line.ip in connected_ip_list else Qt.gray)
+            self.table.setItem(idx, 0, status_item)
+
+            # IP Column (ensuring valid IP format)
+            ip_item = QTableWidgetItem(line.ip)
+            self.table.setItem(idx, 1, ip_item)
+
+            # Line Index Column (ensuring integer values only)
+            line_idx_item = QTableWidgetItem(str(line.line_idx))
+            self.table.setItem(idx, 2, line_idx_item)
+
+            # 
+            test_grade_item = QTableWidgetItem(0)
+            self.table.setItem(idx, 3, test_grade_item)
+            
+        # Save Button to store the IP and Line Index
+        save_button = QPushButton("Save")
+        save_button.clicked.connect(self.save_config)
+        layout.addWidget(save_button)
+        
+        # Refresh Button
+        self.refresh_button = QPushButton("새로고침")
+        self.refresh_button.clicked.connect(self.refresh_btn)
+        layout.addWidget(self.refresh_button)
+        
+        self.sync_button = QPushButton("동기화")
+        self.sync_button.clicked.connect(self.sync_to_gpu)
+        layout.addWidget(self.sync_button)
+        
+        self.sync_offset_button = QPushButton("선별기 offset 맞춤 작업 시작")
+        self.sync_offset_button.clicked.connect(self.sync_offset_to_sorter)
+        layout.addWidget(self.sync_offset_button)
+        
+        # Previous Button
         self.prev_button = QPushButton("Previous")
         self.prev_button.clicked.connect(self.on_prev)
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.prev_button)
         button_layout.addStretch(1)
-
+        
         layout.addLayout(button_layout)
+        layout.addWidget(self.table)
+        
+        # Listing connected IPs
+        self.connected_ips_table = QTableWidget()
+        self.connected_ips_table.setRowCount(len(connected_ip_list))
+        self.connected_ips_table.setColumnCount(1)
+        self.connected_ips_table.setHorizontalHeaderLabels(["Connected IPs"])
+
+        for i, ip in enumerate(connected_ip_list):
+            ip_item = QTableWidgetItem(ip)
+            self.connected_ips_table.setItem(i, 0, ip_item)
+        
+        layout.addWidget(self.connected_ips_table)
+
         self.setLayout(layout)
+        
+    def sync_offset_to_sorter(self):
+        root_config: RootConfig = load_server_root_config()
+        config: ServerConfig = root_config.config
+        
+        result_sender_module = self.main_widget.get_result_sender_module(config.serial_config.production_result_sender_module)
+        result_sender_class = getattr(result_sender_module, 'ResultSender', None)
+        # TODO result_sender는 스레드고 self.result_sender_thread로 지정한다.
+        # result_sender스레드가 지정되어 있다면 강제 종료시킨다.
+        if self.result_sender_thread and self.result_sender_thread.is_alive():
+            self.result_sender_thread.stop()
+            self.result_sender_thread.join()
+
+        try:
+            self.result_sender_thread = ResultSenderThread(result_data_queue=self.result_data_queue)
+            self.result_sender_thread.log_signal.connect(self.main_widget.update_log)
+            self.result_sender_thread.start()
+        except Exception as e:
+            if self.result_sender_thread and self.result_sender_thread.is_alive():
+                self.result_sender_thread.stop()
+                self.result_sender_thread.join()
+            print(e)
+            
+    def sync_to_gpu(self):
+        root_config: RootConfig = load_server_root_config()
+        config: ServerConfig = root_config.config
+        
+        from server_config_app import connected_line_set
+        saved_lines = config.program_config.lines
+        for ws in connected_line_set:
+            for saved_line in saved_lines:
+                if str(ws.client.host) == saved_line.ip:
+                    data = {
+                        "line_idx": saved_line.line_idx,
+                        "number_of_cut": config.serial_config.signal_count_per_pulse
+                    }
+                    asyncio.run_coroutine_threadsafe(self.send_message_to_line(ws, data), self.loop)
+
+    async def send_message_to_line(self, ws, data: dict):
+        data = json.dumps(data)
+        await ws.send_text(data)
+
+    def save_config(self):
+        root_config: RootConfig = load_server_root_config()
+        config: ServerConfig = root_config.config
+        lines = []
+        for row in range(self.table.rowCount()):
+            ip_item = self.table.item(row, 1)
+            line_idx_item = self.table.item(row, 2)
+
+            if ip_item is None:
+                QMessageBox.warning(self, "Missing Data", f"Row {row + 1} has an empty IP cell.")
+                return
+            
+            if line_idx_item is None:
+                QMessageBox.warning(self, "Missing Data", f"Row {row + 1} has an empty Line Index cell.")
+                return
+            try:
+                # Validate line index is an integer
+                line_idx = int(line_idx_item.text())
+            except ValueError:
+                QMessageBox.warning(self, "Invalid Line Index", f"Row {row + 1} has a non-integer line index.")
+                return
+            lines.append(Line(ip=ip_item.text(), line_idx=line_idx))
+            # Here you would save the IP and line_idx to your config or database
+            print(f"Saving IP: {ip_item.text()}, Line Index: {line_idx}")
+        config.program_config.lines = lines
+        is_saved = self.main_widget.save_root_config(root_config)
+        if not is_saved:
+            return
+        QMessageBox.information(self, "Success", "Configuration saved successfully.")
+        self.initUI()
+
+    def refresh_btn(self):
+        self.initUI()
+
+    async def send_message_to_lines(self, message):
+        await broadcast_message(message)
+
+    def update_status(self, ip, is_connected):
+        # Find the row by IP and update the status
+        for row in range(self.table.rowCount()):
+            ip_item = self.table.item(row, 1)
+            if ip_item.text() == ip:
+                status_item = self.table.item(row, 0)
+                if is_connected:
+                    status_item.setBackground(Qt.green)  # Set to green if connected
+                else:
+                    status_item.setBackground(Qt.gray)  # Set to gray if disconnected
+                break
 
     def on_prev(self):
         current_index = self.tab_widget.currentIndex()
         self.tab_widget.setCurrentIndex(current_index - 1)
 
+    # 소켓으로 부터 클라이언트를 받으면 해당 result_sender모듈 queue에 넣어야한다.
+    # 확인 후에는 스레드를 종료해야만 한다.
+    # 싱글톤으로 구현해야한
+    
+    # 챌린지
+    # 소켓에서 받은 데이터를 queue에 넘기기
+    # 스레드 컨트롤을 해야한다.(시작, 종료)
 
-class SerialConfigTab(QWidget):
-    def __init__(self, parent=None, tab_widget=None):
-        super(SerialConfigTab, self).__init__(parent)
-        self.tab_widget = tab_widget
-        self.initUI()
-
-    def initUI(self):
-        layout = QVBoxLayout()
-        self.label = QLabel("프로덕션 시리얼 세팅")
-
+    # 모두 연결 되었는지 확인 -> 스레드 시작했는지 확인 -> 데이터를 받았는지 확인
 
 class SpecificationUploadTab(QWidget):
-    def __init__(self, parent=None, tab_widget=None):
+    def __init__(self, parent=None, tab_widget=None, main_widget=None):
         super(SpecificationUploadTab, self).__init__(parent)
         self.tab_widget = tab_widget
+        self.main_widget = main_widget
         self.initUI()
 
     def initUI(self):
         self.layout = QVBoxLayout()
-        self.label = QLabel("명세서 업로드")
-        self.layout.addWidget(self.label)
+        # self.label = QLabel("명세서 업로드")
+        # self.layout.addWidget(self.label)
 
-        self.upload_button = QPushButton("Upload pyproject.toml")
+        self.upload_button = QPushButton("pyproject.toml 파일을 업로드해주세요.")
         self.upload_button.clicked.connect(self.upload_file)
         self.layout.addWidget(self.upload_button)
 
-        # TODO 저장
         self.sender_combo = QComboBox()
         self.layout.addWidget(self.sender_combo)
+        self.initializing = True
+        self.sender_combo.currentTextChanged.connect(self.on_sender_combo_change)
 
+        self.update_button = QPushButton("현재 프로그램 업데이트")
+        self.update_button.clicked.connect(self.update_program)
+        self.layout.addWidget(self.update_button)
+        
         self.prev_button = QPushButton("Previous")
         self.prev_button.clicked.connect(self.on_prev)
         self.next_button = QPushButton("Next")
@@ -736,6 +1298,73 @@ class SpecificationUploadTab(QWidget):
         self.layout.addLayout(button_layout)
 
         self.setLayout(self.layout)
+
+    def update_program(self):
+        self.main_widget.update_log("인터넷 환경 및 용량에 따라 시간 차이가 생깁니다.")
+        QMessageBox.information(self, "업데이트", "업데이트 이후 프로그램 재실행합니다.")
+
+        try:
+            # subprocess를 통해 업데이트 명령어 실행
+            subprocess.run(["poetry", "update"], check=True)
+        except subprocess.CalledProcessError as update_error:
+            print(f"poetry update 실패: {update_error}")
+            QMessageBox.critical(
+                self, "Error", f"Failed to update dependencies: {update_error}\n관리자 문의 필요"
+            )
+        else:
+            QMessageBox.information(self, "완료", "업데이트 완료. 프로그램 재실행")
+            self.main_widget.restart_program()
+        # finally:
+        #     progress_dialog.close()
+
+    def on_sender_combo_change(self):
+        if self.initializing:
+            self.initializing = False
+            return
+        root_config: RootConfig = load_server_root_config()
+        config: ServerConfig = root_config.config
+        current_value = self.sender_combo.currentText()
+        production_serial = config.serial_config.production_result_sender_module
+        if current_value == "----":
+            QMessageBox.warning(self, "Warning", "초기 값 선택 불가")
+            self.sender_combo.setCurrentText(str(production_serial))
+            return
+
+        if current_value == production_serial:
+            self.sender_combo.setCurrentText(production_serial)
+            return
+        # 기존 값과 다른 경우 확인 창 표시
+        reply = QMessageBox.question(
+            self, 
+            '확인', 
+            f"현재 선택된 '{current_value}'로 변경 시에 해당 모듈에 맞는 기본 설정으로 바뀝니다. 변경하시겠습니까?"
+            "변경 이후 프로그램 재실행됩니다.",
+            QMessageBox.Yes | QMessageBox.No, 
+            QMessageBox.No
+        )
+        if reply == QMessageBox.No:
+            self.sender_combo.setCurrentText(production_serial)
+            return
+        try:
+            result_sender_module = self.main_widget.get_result_sender_module(current_value)
+            result_sender = getattr(result_sender_module, 'ResultSender', None)
+            if result_sender:
+                result_sender.create_default_config()
+            else:
+                QMessageBox.critical(self, "오류", "모듈을 불러오는 데 실패했습니다. 재실행 이후에도 같은 문제 발생 시 관리자 문의")
+                return
+            # 설정을 실제로 업데이트
+            root_config: RootConfig = load_server_root_config()
+            config: ServerConfig = root_config.config
+            config.serial_config.production_result_sender_module = current_value
+            is_saved = self.main_widget.save_root_config(root_config)
+            if not is_saved:
+                return
+            self.sender_combo.setCurrentText(current_value)
+            QMessageBox.information(self, "완료", f"설정이 '{current_value}'로 성공적으로 변경되었습니다. 프로그램 재실행합니다.")
+            self.main_widget.restart_program()
+        except ImportError as e:
+            QMessageBox.critical(self, "오류", f"모듈 저장 실패: {e}")
 
     def upload_file(self):
         options = QFileDialog.Options()
@@ -753,20 +1382,10 @@ class SpecificationUploadTab(QWidget):
         QMessageBox.information(self, "설치", "필요한 모듈을 설치합니다.")
         self.process_toml_file(file_name)
 
-    def is_package_importable(self, package_name):
-        try:
-            importlib.import_module(package_name)
-            return True
-        except ImportError:
-            return False
-
     def process_toml_file(self, file_path):
         try:
             with open(file_path, "r") as toml_file:
                 toml_data = toml.load(toml_file)
-                print(
-                    toml_data.get("tool", {}).get("poetry", {}).get("dependencies", {})
-                )
             self.install_dependencies(
                 toml_data.get("tool", {}).get("poetry", {}).get("dependencies", {})
             )
@@ -776,12 +1395,17 @@ class SpecificationUploadTab(QWidget):
             )
         else:
             self.update_senders_dropdown()
-            QMessageBox.information(self, "완료", "프로그램 다운로드 완료")
+            QMessageBox.information(self, "완료", "프로그램 다운로드 프로세스 완료")
 
     def update_senders_dropdown(self):
+        root_config: RootConfig = load_server_root_config()
+        config: ServerConfig = root_config.config
+        # TODO 기존 sender_combo 초기화
+        self.sender_combo.clear()
         try:
-            sender_module = importlib.import_module("result_sender")
+            sender_module = importlib.import_module(f"{NeedPackageEnum.ResultSender.value}")
             all_senders = getattr(sender_module, "__all_senders__", [])
+            print(all_senders, 'all_senders')
             self.sender_combo.addItems(all_senders)
         except ImportError:
             QMessageBox.warning(
@@ -789,6 +1413,8 @@ class SpecificationUploadTab(QWidget):
                 "Module Error",
                 "result_sender module not found or does not have __all_senders__ attribute.",
             )
+        else:
+            self.sender_combo.setCurrentText(str(config.serial_config.production_result_sender_module))
 
     def install_dependencies(self, dependencies):
         backup_pyproject = "pyproject.toml.bak"
@@ -804,7 +1430,11 @@ class SpecificationUploadTab(QWidget):
             for package in list(dependencies.keys()):
                 if package == "python":
                     continue
-                subprocess.run(["poetry", "remove", package], check=True)
+                try:
+                    subprocess.run(["poetry", "remove", package], check=True)
+                except subprocess.CalledProcessError as remove_error:
+                    print("Remove Error", remove_error)
+                    continue
 
             # dependencies에 있는 패키지를 모두 추가
             for package, version in dependencies.items():
@@ -831,11 +1461,13 @@ class SpecificationUploadTab(QWidget):
                 print(f"poetry update 실패: {update_error}")
                 QMessageBox.critical(
                     self, "Error", f"Failed to update dependencies: {update_error}"
+                    "관리자 문의 필요"
                 )
 
         else:
             print("Dependencies installed successfully.")
-            QMessageBox.information(self, "완료", "모든 패키지 설치 완료.")
+            QMessageBox.information(self, "완료", "모든 패키지 설치 완료. 프로그램 재실행합니다.")            
+            self.main_widget.restart_program()
         finally:
             # 백업 파일 삭제
             if os.path.exists(backup_pyproject):
@@ -883,12 +1515,26 @@ class SpecificationUploadTab(QWidget):
         self.tab_widget.setCurrentIndex(current_index - 1)
 
     def on_next(self):
-        missing_packages = self.tab_widget.check_packages()
+        missing_packages = self.main_widget.check_packages()
         if missing_packages:
             QMessageBox.critical(
                 self, "설치 필요", f"패키지 [{', '.join(missing_packages)}]가 없습니다."
             )
-
+            return
+        root_config = load_server_root_config()
+        config: ServerConfig = root_config.config
+        if not config.serial_config.production_result_sender_module:
+            QMessageBox.critical(
+                self, "설정 값 필요", "프로덕션 시리얼 패키지를 지정해주세요."
+            )
+            return
+        production_result_sender = self.main_widget.get_result_sender_module(config.serial_config.production_result_sender_module)
+        
+        if not production_result_sender:  # 실제 프로덕션 패키지를 실행했는지를 확인하는 부분
+            QMessageBox.critical(
+                self, "설정 값 필요", "프로덕션 시리얼 패키지를 지정해주세요."
+            )
+            return
         current_index = self.tab_widget.currentIndex()
         self.tab_widget.setTabEnabled(current_index + 1, True)
         self.tab_widget.setCurrentIndex(current_index + 1)
@@ -908,43 +1554,89 @@ def merge_toml_files(existing_toml_path, new_toml_path):
         toml.dump(merged_toml, f)
 
     return merged_toml
-
-
-class SignalSettings(QTabWidget):
-    def __init__(self):
+from multiprocessing import Queue
+from server import data_queue
+# class SignalSettings(QTabWidget):
+class SignalSettings(QWidget):
+    def __init__(self, loop=None):
         super().__init__()
+        self.loop = loop
+        self.result_data_queue = data_queue
         self.initUI()
         self.setup_logging()
         self.setup_shortcuts()
         self.load_previous_settings()
-        self.update_tab_enablement()
-        self.need_packages = ["result_sender", "local_server"]
+        self.server_thread.start()
+        self.need_packages = [package_enum.value for package_enum in NeedPackageEnum]
 
     def initUI(self):
-        self.line_count_tab = LineCountTab(self, tab_widget=self)
-        self.serial_test_tab = SerialTestTab(self, tab_widget=self)
-        self.arduino_upload_tab = ArduinoUploadTab(self, tab_widget=self)
-        self.conveyor_message_tab = ConveyorMessageTab(self, tab_widget=self)
-        self.specification_upload_tab = SpecificationUploadTab(self, tab_widget=self)
+        # 메인 레이아웃 설정
+        main_layout = QVBoxLayout(self)
 
-        self.addTab(self.line_count_tab, "라인 개수 입력")
-        self.addTab(self.serial_test_tab, "시리얼 테스트")
-        self.addTab(self.specification_upload_tab, "명세서 업로드")
-        self.addTab(self.arduino_upload_tab, "프로덕션 아두이노 코드 업로드")
-        self.addTab(self.conveyor_message_tab, "선별기 메시지 전송")
+        # 탭 위젯을 위한 섹션
+        self.tab_widget = QTabWidget(self)
+        self.line_count_tab = LineCountTab(self, tab_widget=self.tab_widget, main_widget=self)
+        self.serial_test_tab = SerialTestTab(self, tab_widget=self.tab_widget, main_widget=self)
+        self.specification_upload_tab = SpecificationUploadTab(self, tab_widget=self.tab_widget, main_widget=self)
+        self.arduino_upload_tab = ArduinoUploadTab(self, tab_widget=self.tab_widget, main_widget=self)
+        self.conveyor_message_tab = ConveyorMessageTab(self, tab_widget=self.tab_widget, main_widget=self, loop=self.loop, result_data_queue=self.result_data_queue)
 
-        self.setTabEnabled(1, False)
-        self.setTabEnabled(2, False)
-        self.setTabEnabled(3, False)
-        self.setTabEnabled(4, False)
+        self.tab_widget.addTab(self.line_count_tab, "라인 개수 입력")
+        self.tab_widget.addTab(self.serial_test_tab, "시리얼 테스트")
+        self.tab_widget.addTab(self.specification_upload_tab, "명세서 업로드")
+        self.tab_widget.addTab(self.arduino_upload_tab, "프로덕션 아두이노 코드 업로드")
+        self.tab_widget.addTab(self.conveyor_message_tab, "선별기 메시지 전송")
 
-        # Add file upload button
+        self.tab_widget.setTabEnabled(TabIndexEnum.SERIAL_TEST.value, False)
+        self.tab_widget.setTabEnabled(TabIndexEnum.SPECIFICATION_UPLOAD.value, False)
+        self.tab_widget.setTabEnabled(TabIndexEnum.ARDUINO_UPLOAD.value, False)
+        self.tab_widget.setTabEnabled(TabIndexEnum.CONVEYOR_MESSAGE.value, False)
+
+        # self.tab_widget.currentChanged.connect(self.on_tab_changed)
+        # 탭 위젯을 메인 레이아웃에 추가
+        main_layout.addWidget(self.tab_widget)
+        self.server_thread = FastAPIServerThread()
+        # 로그 섹션 추가
+        self.log_text_edit = QTextEdit()
+        self.log_text_edit.setReadOnly(True)  # 로그 창은 읽기 전용으로 설정
+        self.server_thread.log_signal.connect(self.update_log)
+        main_layout.addWidget(self.log_text_edit)
+
+    def update_log(self, log_message):
+        self.log_text_edit.append(log_message)
+
+    def on_tab_changed(self, index):
+        # 특정 조건이 맞지 않을 때 탭 이동을 막기 (여기서는 Tab 1에서만 제약을 둠)
+        if index == 1:  # Tab 2로 이동하려고 할 때
+            if not self.is_allowed_to_switch():
+                # 조건이 맞지 않으면 경고 메시지와 함께 탭 변경을 막음
+                QMessageBox.warning(self, "Warning", "You are not allowed to switch to Tab 2 yet!")
+                self.setCurrentIndex(0)  # 다시 Tab 1로 돌아감
 
     def load_previous_settings(self):
         root_config: RootConfig = load_server_root_config()
         config: ServerConfig = root_config.config
+        serial_result_sender = config.serial_config.production_result_sender_module
+        if self.is_package_importable(f"{NeedPackageEnum.ResultSender.value}"):
+            sender_module = importlib.import_module(f"{NeedPackageEnum.ResultSender.value}")
+            all_senders = getattr(sender_module, "__all_senders__", [])
+            self.specification_upload_tab.sender_combo.clear()
+            self.specification_upload_tab.sender_combo.addItem('----')
+            self.specification_upload_tab.sender_combo.addItems(all_senders)
         self.line_count_tab.line_edit.setText(str(config.program_config.line_count))
-        self.setTabEnabled(1, True)
+        
+        if int(config.program_config.line_count):
+            self.update_log("라인 수 지정 완료!")
+            self.tab_widget.setTabEnabled(TabIndexEnum.SERIAL_TEST.value, True)
+        else:
+            self.update_log("**라인 수 지정 필요**")
+            
+        if config.arduino_config.is_upload_port_assigned:
+            self.update_log("업로드 아두이노 포트 지정 완료!")
+            self.tab_widget.setTabEnabled(TabIndexEnum.SPECIFICATION_UPLOAD.value, True)
+        else:
+            self.update_log("**업로드 아두이노 포트 지정 필요**")
+            
         self.serial_test_tab.message_edit.setText(config.arduino_config.test_message)
         self.serial_test_tab.baudrate_combo.setCurrentText(
             str(config.arduino_config.baudrate)
@@ -962,20 +1654,27 @@ class SignalSettings(QTabWidget):
         self.serial_test_tab.format_combo.setCurrentText(
             config.serial_config.test_message_format_type.value
         )
+        serial_result_sender_module = self.get_result_sender_module(f"{serial_result_sender}")
 
-        self.setTabEnabled(2, True)
+        if serial_result_sender and serial_result_sender_module:
+            self.specification_upload_tab.sender_combo.setCurrentText(serial_result_sender)
+            self.tab_widget.setTabEnabled(TabIndexEnum.ARDUINO_UPLOAD.value, True)
+            self.update_log("프로덕션 모듈 선택 완료!")
+        else:
+            self.update_log("**프로덕션 모듈 선택 필요**")
 
-    def update_tab_enablement(self):
-        # TODO 순차적으로 돌면서 막히는 곳을 막음
-        # line_count가 0이면 막기부터 시작
-        if self.line_count_tab.line_edit.text():
-            self.setTabEnabled(1, True)
-        if (
-            self.serial_test_tab.message_edit.text()
-            and self.serial_test_tab.baudrate_combo.currentText()
-        ):
-            self.setTabEnabled(2, True)
-        # Additional conditions for other tabs can be added here
+        if config.serial_config.is_production_sketch_uploaded:
+            self.tab_widget.setTabEnabled(TabIndexEnum.CONVEYOR_MESSAGE.value, True)
+            self.update_log("프로덕션 아두이노 코드 업로드 완료!")
+        else:
+            self.update_log("**프로덕션 아두이노 코드 업로드 필요**")
+    def get_result_sender_module(self, result_sender: str):
+        """ResultSender가 있는 모듈을 반환합니다"""
+        target_module = f"{NeedPackageEnum.ResultSender.value}.all_senders.{result_sender}"
+        if not self.is_package_importable(target_module):
+            return None
+        return importlib.import_module(target_module)
+
 
     def setup_logging(self):
         logging.basicConfig(
@@ -984,6 +1683,7 @@ class SignalSettings(QTabWidget):
             format="%(asctime)s - %(message)s",
         )
         logging.info("Program started.")
+        logging.info("Program started2.")
 
     def setup_shortcuts(self):
         quit_action = QAction(QIcon("exit.png"), "Exit", self)
@@ -1026,10 +1726,51 @@ class SignalSettings(QTabWidget):
                 missing_packages.append(package)
         return missing_packages
 
+    def is_package_importable(self, package_name):
+        try:
+            importlib.import_module(package_name)
+            return True
+        except ImportError:
+            return False
+
+    def restart_program(self):
+        """현재 실행 중인 프로그램을 재실행합니다."""
+        try:
+            python = sys.executable
+            os.execl(python, python, *sys.argv)
+        except Exception as e:
+            print(f"Error restarting the program: {e}")
+            sys.exit(1)  # 재실행에 실패한 경우 프로그램을 종료
+    
+    def save_root_config(self, root_config: RootConfig):
+        try:
+            save_config(root_config)
+        except Exception as e:
+            QMessageBox.critical(self, "저장 오류", f"저장 오류. 관리자 문의 필요 {e}")
+            return False
+        return True
+
+def start_event_loop(loop):
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
 
 if __name__ == "__main__":
+    new_loop = asyncio.new_event_loop()
+    
+    loop_thread = threading.Thread(target=start_event_loop, args=(new_loop,), daemon=True)
+    loop_thread.start()
+    # Start the event loop in a new thread
     backup_config()
+    # TODO test_status를 True로 변경하고 종료 시에는 반드시 test_status를 false로 변경한다.
     app = QApplication(sys.argv)
-    ex = SignalSettings()
+    ex = SignalSettings(loop=new_loop)
     ex.show()
     sys.exit(app.exec_())
+
+
+# 메시지 전송
+# - result_sernder의 log를 찍어주는 것이 좋아보임
+# - 시작했다는 알림 필요
+
+# 메시지 전송 완료? -> 실제 프로그램 실행 하는 곳도 필요해보임

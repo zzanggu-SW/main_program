@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "main-program-test"
-version = "0.1.0"
+version = "0.2.0"
 description = ""
 authors = ["zzanggu-SW <gyeongmin951@aiofarm.co.kr>"]
 readme = "README.md"
@@ -17,6 +17,7 @@ pillow = "^10.4.0"
 bs4 = "^0.0.2"
 server-config-model = {git = "ssh://git@github.com/zzanggu-SW/config-model.git", rev = "v0.1-beta"}
 psutil = "^6.0.0"
+fastapi = {extras = ["standard"], version = "^0.112.2"}
 
 [tool.poetry.group.dev.dependencies]
 black = "^24.8.0"
