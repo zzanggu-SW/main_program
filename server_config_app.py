@@ -90,8 +90,6 @@ class LineCountTab(QWidget):
         line_layout.addWidget(self.line_edit)
         self.line_edit.setValidator(QIntValidator())  # Allow only integers
 
-        # TODO 현재 프로그램의 ipconfig 결과를 보여주는 것 필요
-
         # ipconfig 결과를 보여주는 섹션
         ipconfig_layout = QVBoxLayout()
         ipconfig_label = QLabel("2. 현재 프로그램의 ipconfig 결과:")
@@ -1150,7 +1148,7 @@ class ConveyorMessageTab(QWidget):
         self.table.setHorizontalHeaderLabels(
             ["Status", "IP", "Line Index", "Test 등급"]
         )
-        from server_config_app import connected_line_set
+        from server import connected_line_set
 
         connected_ip_list = [line.client.host for line in connected_line_set]
         lines = sorted(self.config.program_config.lines, key=lambda c: c.ip)
@@ -1186,7 +1184,7 @@ class ConveyorMessageTab(QWidget):
         layout.addWidget(self.refresh_button)
 
         self.sync_button = QPushButton("동기화")
-        self.sync_button.clicked.connect(self.sync_to_gpu)
+        self.sync_button.clicked.connect(self.fruit_from_gpu)
         layout.addWidget(self.sync_button)
 
         self.sync_offset_button = QPushButton("선별기 offset 맞춤 작업 시작")
@@ -1243,7 +1241,7 @@ class ConveyorMessageTab(QWidget):
                 self.result_sender_thread.join()
             print(e)
 
-    def sync_to_gpu(self):
+    def fruit_from_gpu(self):
         root_config: RootConfig = load_server_root_config()
         config: ServerConfig = root_config.config
 
@@ -1618,7 +1616,7 @@ class SpecificationUploadTab(QWidget):
                 self, "설치 필요", f"패키지 [{', '.join(missing_packages)}]가 없습니다."
             )
             return
-        root_config = load_server_root_config()
+        root_config: RootConfig = load_server_root_config()
         config: ServerConfig = root_config.config
         if not config.serial_config.production_result_sender_module:
             QMessageBox.critical(
