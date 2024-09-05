@@ -7,7 +7,6 @@ from PyQt5.QtCore import QThread, pyqtSignal
 import logging
 from queue import Queue
 from server_config_model import RootConfig, ServerConfig, load_server_root_config
-from result_sender.all_senders.prusen import ResultSender
 
 
 class QTextEditHandler(logging.Handler):
